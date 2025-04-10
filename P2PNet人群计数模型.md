@@ -2,11 +2,12 @@
 
 ```cpp
 git status
+git add .
 git commit -m "update: xxxx(2024-04-08)"
 git push
 ```
 
-
+【【精读AI论文】VGG深度学习图像分类算法】https://www.bilibili.com/video/BV1fU4y1E7bY?p=9&vd_source=3471d188fd1d74b6d33be0296ab20feb
 
 # 模型特点
 
@@ -14,27 +15,33 @@ git push
 
 #### VGG16
 
-一种**卷积神经网络**架构
+VGG16输入：[3,224,224]图片
 
-输入：图片，如[3,224,224]
+![VGG16](E:\markdown\crowdcounting-notes\截图\VGG16.png)
 
-输出：多个特征图[512,14,14]
+**注意block1/2/3/4/5包括了：Conv + maxpool**
+
+**注意block1/2/3/4/5还可以叫做C1/2/3/4/5**
+
+![QQ20250410-183439](E:\markdown\crowdcounting-notes\截图\QQ20250410-183439.png)
+
+**Conv3-64**指：64个3*3\*【通道数】的卷积核（换句话说，卷积层的深度自动与输入的通道数匹配）。3\*3\*3的卷积核可以理解为对每一'层'[1,254,254]运用3\*3卷积核，得到3个[1,254,254]再相加。
+
+**FC-4096**：`4096`个神经元的`全连接层(FC)`
+
+经过maxpool变成[64,112,112]。**池化层降低分辨率**
+
+每一层卷积之后通常都会接一个非线性激活函数（比如ReLU）
 
 > ##### 使用特征金字塔网络（FPN）融合多尺度特征。
 
-#### 多尺度特征
+#### FPN
 
-在图像里，有的人可能很小（远处），有的人很大（近处），这时候需要：
+本项目中，FPN的唯一输入就是输入经VGG16网络的C3,C4,C5的中间结果（是特征图）
 
-- 低层（前几层卷积）：保留了更多细节，适合小物体
-
-- 高层（后几层卷积）：保留了更多语义，适合大物体
+**下采样：**指分辨率降低。比如8倍下采样就是[B,C,H,W]->[B,C,H/8,W/8]。通道数变化不知道。但CNN一般会在下采样的同时扩大通道数。
 
 ### 特征图
-
-**数据结构**
-
-一个特征图就是一个`torch.Tensor` 对象，一般是[B,C,H,W]/[C,H,W]
 
 **对应程序**
 
@@ -62,31 +69,15 @@ FPN 结构会：
 
 融合成统一大小/语义的多尺度特征图（例如 P3, P4, P5）
 '''
-features = self.backbone(samples)# 返回一个 list：[C2, C3, C4, C5]
-features_fpn = self.fpn([features[1], features[2], features[3]])#把C3, C4, C5融合
+features = self.backbone(samples)# 返回一个 list：[C1_2, C3, C4, C5]
+features_fpn = self.fpn([features[1], features[2], features[3]])
 
 #输出：这些融合后的特征图仍然是 torch.Tensor，只是包含更多信息。
 ```
 
-`features` 是从 backbone（VGG16 + 提取层）中提取出来的中间结果
+**features:[C1_2, C3, C4, C5]**是输入经VGG16网络在这几个block输出的中间结果（是特征图）
 
-它是一个 **list of torch.Tensor**
 
-```python
-features = [C1, C2, C3, C4]
-```
-
-其中每个 Cn 都是一个 **特征图**
-
-它们是从 **VGG16 的每一层卷积模块（conv block）** 输出的特征图。
-
-| 编号 | 层级    | 输出尺寸（假设输入为224×224） | 特征语义           |
-| ---- | ------- | ----------------------------- | ------------------ |
-| C1   | conv1_2 | `[64, 112, 112]`              | 较低级（边缘）     |
-| C2   | conv2_2 | `[128, 56, 56]`               | 低级（纹理）       |
-| C3   | conv3_3 | `[256, 28, 28]`               | 中级（局部结构）   |
-| C4   | conv4_3 | `[512, 14, 14]`               | 高级（物体部件）   |
-| C5   | conv5_3 | `[512, 7, 7]`                 | 更高级（语义目标） |
 
 > ##### 使用分类与回归两个分支预测人群数量与位置。
 
@@ -135,6 +126,19 @@ def generate_anchor_points(stride=16, row=3, line=3):
 
 `row = 3,line = 3`：均匀分布`row  * line`个anchor point
 
+- 假设模型输入图像是 `512×512`
+
+- Backbone + FPN 输出的特征图是 `32×32`
+
+- 那么每个 anchor 就覆盖一块：
+
+  ```
+  复制编辑
+  512 / 32 = 16 像素 × 16 像素
+  ```
+
+👉 所以每个 anchor roughly 负责周围 `16×16` 像素区域的人头
+
 > ##### 使用匈牙利算法（Hungarian Matcher）匹配预测点与真实点。
 
 > ##### 整个模型训练过程使用 Adam 优化器和交叉熵损失以及位置回归损失
@@ -176,6 +180,28 @@ def generate_anchor_points(stride=16, row=3, line=3):
 - **输出**：
   - 带预测点的可视化图片保存在 `output_dir` 中。
 
+```py
+from PIL import Image
+
+img_path = "./vis/demo1.jpg"
+
+img_raw = Image.open(img_path).convert('RGB')
+#img_raw 用来存储加载后的图像对象
+#convert('RGB')将图像转换成3通道
+
+width, height = img_raw.size
+#img_raw.size返回含两个整数（宽度和高度）的元组
+
+new_width = width // 128 * 128
+new_height = height // 128 * 128
+#先整数除128再乘以128：图形大小变成128的整数倍
+
+img_raw = img_raw.resize((new_width, new_height), Image.ANTIALIAS)
+#Image.ANTIALIAS是一个滤波器
+```
+
+
+
 ------
 
 ### `train.py`
@@ -188,6 +214,12 @@ def generate_anchor_points(stride=16, row=3, line=3):
   - 日志文件（`run_log.txt`）
   - TensorBoard 可视化日志（默认保存到 `./runs`）
   - 检查点文件：`latest.pth`、`best_mae.pth`
+
+```python
+from crowd_datasets import build_dataset
+loading_data = build_dataset(args=args)#args是命令行参数
+train_set, val_set = loading_data(args.data_root)
+```
 
 ------
 
@@ -214,6 +246,12 @@ def generate_anchor_points(stride=16, row=3, line=3):
 - **输出**：
   - 图像张量 `img`：Tensor, `[C, H, W]`
   - 目标列表 `target`：每个元素为一个字典，含 `point`（点坐标）、`image_id` 和 `labels`
+
+```py
+class SHHA(Dataset)#继承自PyTorch 的 Dataset类
+```
+
+
 
 ------
 
@@ -284,6 +322,7 @@ def __init__(self, num_features_in, num_anchor_points=4, feature_size=256):
 
         self.output = nn.Conv2d(feature_size, num_anchor_points * 2, kernel_size=3, padding=1)
 #[B, C, H, W] → reshape → [B, N, 2]
+#x 是 Tensor[B, C, H, W]
  def forward(self, x):
         out = self.conv1(x)
         out = self.act1(out)
@@ -293,7 +332,7 @@ def __init__(self, num_features_in, num_anchor_points=4, feature_size=256):
 
         out = self.output(out)
 
-        out = out.permute(0, 2, 3, 1)
+        out = out.permute(0, 2, 3, 1)#[B, 8, H, W] → [B, H, W, 8]把通道放最后，方便 reshape
 
         return out.contiguous().view(out.shape[0], -1, 2)
 ```
@@ -677,7 +716,41 @@ def build(args, training):
 - **输出**：
   - 多层特征图（可用于 FPN）
 
-------
+```py
+#backbone:一个预构建好的 VGG 网络   num_channels:希望提取出来的特征图的通道数
+#name:指定使用的 VGG 模型名称，比如 'vgg16_bn' 或 'vgg16'   
+#return_interm_layers:布尔值，用来控制是否返回中间层的特征图。如果是 True，就会把 VGG 网络分割成若干部分，分别提取；如果 False，则只保留最后的一个整体输出。
+def __init__(self, backbone: nn.Module, num_channels: int, name: str, return_interm_layers: bool):
+        super().__init__()
+        features = list(backbone.features.children())
+        #backbone.features 是 VGG 网络中专门提取卷积层部分的成员（通常是一个 nn.Sequential 对象）
+        #而 children() 方法返回其中所有子模块（每一层）的迭代器
+        #features 就是一个列表，里面存放了 VGG 网络中所有卷积、池化、激活等层
+        
+        
+        if return_interm_layers:
+            if name == 'vgg16_bn':
+                self.body1 = nn.Sequential(*features[:13])   #C1,2
+                self.body2 = nn.Sequential(*features[13:23]) #C3
+                self.body3 = nn.Sequential(*features[23:33]) #C4
+                self.body4 = nn.Sequential(*features[33:43]) #C5
+            else:
+                self.body1 = nn.Sequential(*features[:9])    #C1,2
+                self.body2 = nn.Sequential(*features[9:16])  #C3
+                self.body3 = nn.Sequential(*features[16:23]) #C4
+                self.body4 = nn.Sequential(*features[23:30]) #C5
+        else:                                                #打包整个c1-5
+            if name == 'vgg16_bn':
+                self.body = nn.Sequential(*features[:44])  # 输出会16倍下采样
+            elif name == 'vgg16':
+                self.body = nn.Sequential(*features[:30])  # 输出会16倍下采样
+        self.num_channels = num_channels
+        self.return_interm_layers = return_interm_layers
+```
+
+别忘了，这里的C1/2/3/4/5就是block1/2/3/4/5
+
+**可以把C/body理解为一个函数，输入为[B,C,H,W]/[C,H,W]输出为[B,C,H,W]/[C,H,W]（特征图）**
 
 ### `vgg_.py`
 
@@ -771,6 +844,83 @@ train.py / run_test.py
 1. 加载模型与预训练权重。
 2. 单张图片进行预测与可视化。
 
+# 程序数据流
+
+## 读入->(img,target)
+
+一张jpg文件+一个标记了人头位置的txt文件，首先读入程序，以下面的方式存储
+
+```py
+img.shape → [3, H, W]
+target = {
+    'point': [[x1, y1], [x2, y2], ..., [xN, yN]],  # 所有标注的人头坐标（像素位置）
+    'labels': [1, 1, ..., 1],  # 所有人头对应的类别标签（全是 1）
+    'image_id': tensor([i])  # 第 i 张图,图像编号
+}
+
+#SHHA类的def __getitem__就是返回 return img, target
+```
+
+## （img，target）被打包成（samples，targets）
+
+第一步构造的哪些(img,target)会打包成以下结构。
+
+**打包：img->samples**
+
+**打包：target->targets**
+
+```py
+samples: NestedTensor（包含图像张量 [B, 3, H, W],以及一个[B,H,W]表明图片哪些地方是padding，为了把所有图片都扩充到H*W所添加的假像素）
+targets: List[dict]，长度为 B，每个 dict 是 target
+```
+
+## samples被送入模型->输出pred_logits, pred_points
+
+samples输入到P2PNet的forward
+
+```py
+def forward(self, samples: NestedTensor):
+        #第一步：提取图像张量
+        features = self.backbone(samples)
+        #features是list：[C3, C4, C5] 
+        
+        
+        #第二步：送入 FPN
+        features_fpn = self.fpn([features[1], features[2], features[3]])
+        #features_fpn是list：[P3, P4, P5]
+        
+        
+        batch_size = features[0].shape[0]
+        #第三步：回归 以及 分类
+        regression = self.regression(features_fpn[1]) * 100 # 8x
+        #regression是坐标偏移[B, N, 2]：Tensor
+        #每个 anchor point 预测一个 (Δx, Δy)
+        classification = self.classification(features_fpn[1])
+        #classfication是输出每个 anchor 的概率[B, N, 2]：Tensor
+        #其中：N 就是每张图中 anchor point 的数量
+        
+        #第四步：生成 anchor 点位置
+        anchor_points = self.anchor_points(samples).repeat(batch_size, 1, 1)
+        #anchor_points是[B, N, 2]，即每个 anchor 的参考坐标
+        
+        
+        #第五步：偏移 + anchor = 预测坐标
+        output_coord = regression + anchor_points
+        output_class = classification
+        
+        
+        out = {'pred_logits': output_class, 'pred_points': output_coord}
+       '''
+       out = {
+             'pred_logits': Tensor [B, N, 2],  # 每个 anchor 点的分类概率
+             'pred_points': Tensor [B, N, 2],  # 每个 anchor 点的预测位置坐标 (x, y)
+}
+       '''
+        return out
+```
+
+
+
 # 程序用到的一些库/函数
 
 ### torch.Tensor
@@ -845,6 +995,23 @@ nn.Conv2d(
     kernel_size=3,   # 卷积核大小：3×3
     padding=1        # 保证输出尺寸不变
 )
+```
+
+### DataSet
+
+```py
+torch                # 顶级模块：PyTorch 的主包
+└── utils            # torch.utils：工具模块（utils）
+    └── data         # torch.utils.data：数据处理相关
+        └── Dataset  # Dataset 类：数据集抽象基类
+```
+
+```py
+因为在 PyTorch 中，所有能送进 DataLoader 的数据集，必须是 Dataset 的子类，并实现两个函数：
+
+__len__()：告诉你总共有多少个样本
+
+__getitem__(index)：告诉你怎么通过索引取出第 index 个样本
 ```
 
 # 代码阅读顺序
