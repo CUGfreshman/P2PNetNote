@@ -9,11 +9,85 @@ git push
 
 【【精读AI论文】VGG深度学习图像分类算法】https://www.bilibili.com/video/BV1fU4y1E7bY?p=9&vd_source=3471d188fd1d74b6d33be0296ab20feb
 
-# 模型特点
+# P2PNet模型特点
 
-> ##### 基于**VGG16**作为骨干网络（Backbone）提取特征
+## 模型处理流程
 
-#### VGG16
+```txt
+samples (image)
+   ↓
+VGG Backbone 提取多层特征 → features = [C3, C4, C5]
+   ↓
+Decoder (FPN)
+   ↓
+features_fpn = P3_x (最终融合特征)
+   ↓
+feed into regression + classification branches
+   ↓
+输出点的位置（回归）+ 点的概率（分类）
+回归分支输出：[B,H*W*anchor,2]即每个锚点的坐标偏移
+分类分支输出：[B,H*W*anchor,1]即每个锚点的概率
+```
+
+```py
+#backbone: 骨干网络（通常是VGG16）
+#row,line： 就是anchor那的参数
+
+class P2PNet(nn.Module):
+    def __init__(self, backbone, row=2, line=2):
+        super().__init__()
+        self.backbone = backbone
+       #有两类
+        self.num_classes = 2                  
+       #每个patch的锚点数量
+        num_anchor_points = row * line         
+       
+       #创建回归和分类分支
+        self.regression = RegressionModel(num_features_in=256, num_anchor_points=num_anchor_points)
+        self.classification = ClassificationModel(num_features_in=256, \
+                                            num_classes=self.num_classes, \
+                                            num_anchor_points=num_anchor_points)
+
+       #锚点
+        self.anchor_points = AnchorPoints(pyramid_levels=[3,], row=row, line=line)
+       
+       #FPN
+        self.fpn = Decoder(256, 512, 512)
+```
+
+```py
+#Samples：输入数据，类型为NestedTensor，包含图像张量（samples.tensors）和掩码（samples.mask）
+
+    def forward(self, samples: NestedTensor):
+
+        features = self.backbone(samples)#[C1_2, C3, C4, C5]
+        
+        features_fpn = self.fpn([features[1], features[2], features[3]])#[P3_x, P4_x, P5_x]
+
+        batch_size = features[0].shape[0]
+
+        #运行回归和分类分支
+        regression = self.regression(features_fpn[1]) * 100 #[B, H*W*4, 2]。这里偏移量乘以 100
+        classification = self.classification(features_fpn[1])#[B, H*W*4, 1]
+        
+        #生成锚点坐标，并重复 batch_size 次以匹配批量大小
+        anchor_points = self.anchor_points(samples).repeat(batch_size, 1, 1)#[B,H*W*anchor,2]每个锚点的坐标
+        
+        #将回归分支预测的偏移量 regression 加到锚点坐标 anchor_points 上，得到最终的点坐标。
+        output_coord = regression + anchor_points
+        
+        #将分类分支的输出 classification 直接作为最终的分类结果
+        output_class = classification
+        
+        #组织输出,作为模型的输出
+        out = {'pred_logits': output_class, 'pred_points': output_coord}
+       
+        return out
+```
+
+
+
+## VGG16
 
 VGG16输入：[3,224,224]图片
 
@@ -25,7 +99,7 @@ VGG16输入：[3,224,224]图片
 
 ![QQ20250410-183439](.\image\QQ20250410-183439.png)
 
-**Conv3-64**指：64个3*3\*【通道数】的卷积核（换句话说，卷积层的深度自动与输入的通道数匹配）。3\*3\*3的卷积核可以理解为对每一'层'[1,254,254]运用3\*3卷积核，得到3个[1,254,254]再相加。
+**Conv3-64**指：64个3*3\*【通道数】的卷积核（卷积层的深度自动与输入的通道数匹配）。3\*3\*3的卷积核可以理解为对每一'层'[1,254,254]运用3\*3卷积核，得到3个[1,254,254]再相加。
 
 **FC-4096**：`4096`个神经元的`全连接层(FC)`
 
@@ -33,111 +107,296 @@ VGG16输入：[3,224,224]图片
 
 每一层卷积之后通常都会接一个非线性激活函数（比如ReLU）
 
-> ##### 使用特征金字塔网络（FPN）融合多尺度特征。
-
-#### FPN
+## FPN
 
 本项目中，FPN的唯一输入就是输入经VGG16网络的C3,C4,C5的中间结果（是特征图）
 
+**VGG的不同层C3,C4,C5**就是FPN所谓的多尺度特征。
+
+低层特征：小尺度，找小人头（远处的人头）
+
+高层特征：大尺度，找大人头（近处的人头）
+
 **下采样：**指分辨率降低。比如8倍下采样就是[B,C,H,W]->[B,C,H/8,W/8]。通道数变化不知道。但CNN一般会在下采样的同时扩大通道数。
 
-### 特征图
-
-**对应程序**
-
-文件：`backbone.py`
+`__init__`
 
 ```python
-#输入图片 -> 特征图
+#Cx_size 指通道数
+#feature_size=256 : FPN 会把所有特征图的通道数统一成 256
 
-xs = self.body(tensor_list)  # 输入图片 -> 特征图
-return [xs]                  # 或多层特征图：[body1, body2, body3, body4]
+#FPN的全部内容
+class Decoder(nn.Module):
+    def __init__(self, C3_size, C4_size, C5_size, feature_size=256):
+        super(Decoder, self).__init__()
 
-'''
-输出:
-是一个或多个张量（Tensor），每个 shape 类似于：[batch_size, 256, H, W]
-'''
+        #第一步：准备处理 C5 → P5
+        #1. 把 C5 从 512通道降到 256
+        self.P5_1 = nn.Conv2d(C5_size, feature_size, kernel_size=1, stride=1, padding=0)
+        #2. 把 C5 的分辨率放大一倍,让它的大小和 C4（下一层地图）一样，方便叠加
+        self.P5_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
+        #3. 进一步处理放大后的特征
+        self.P5_2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
+
+        #第二步：准备处理 C4 → P4
+        #1. 把 C4 转成相同通道数（256）
+        self.P4_1 = nn.Conv2d(C4_size, feature_size, kernel_size=1, stride=1, padding=0)
+        #2. 再放大一倍，准备和更低层的 C3 地图融合
+        self.P4_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
+        #3. 进一步处理放大后的特征
+        self.P4_2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
+
+        #第三步：准备处理 C3 → P3
+        #C3本来就是256通道？注意不同的VGG16也许有区别，不用太在意这里。
+        self.P3_1 = nn.Conv2d(C3_size, feature_size, kernel_size=1, stride=1, padding=0)
+        self.P3_2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
 ```
 
-文件：`p2pnet.py`
+`forward`
 
-```python
-'''
-FPN 结构会：
+```py
+def forward(self, inputs):
+        C3, C4, C5 = inputs
+        
+        #先对C5降通道（通道统一是256），上采样（跟C4一样），卷积再处理一下
+        P5_x = self.P5_1(C5)
+        P5_upsampled_x = self.P5_upsampled(P5_x)
+        P5_x = self.P5_2(P5_x)
 
-把不同层的特征图（例如 C3, C4, C5）
+        #然后对P4降通道，P4 = C4 + 上采样后的 P5，上采样，卷积再处理一下
+        P4_x = self.P4_1(C4)
+        P4_x = P5_upsampled_x + P4_x
+        P4_upsampled_x = self.P4_upsampled(P4_x)
+        P4_x = self.P4_2(P4_x)
 
-融合成统一大小/语义的多尺度特征图（例如 P3, P4, P5）
-'''
-features = self.backbone(samples)# 返回一个 list：[C1_2, C3, C4, C5]
-features_fpn = self.fpn([features[1], features[2], features[3]])
+        #降通道，P3 = C3 + 上采样后的 P4，卷积再处理一下
+        P3_x = self.P3_1(C3)
+        P3_x = P3_x + P4_upsampled_x
+        P3_x = self.P3_2(P3_x)
 
-#输出：这些融合后的特征图仍然是 torch.Tensor，只是包含更多信息。
+        return [P3_x, P4_x, P5_x]
+    #注：返回几个融合程度不同的特征图，通道数都是256，但分辨率依次下降
+    
+#至于这里为什么用P5/4_upsampled_x进行融合而不是P5/4_x：
+#多尺度融合时，应尽可能用原始的深层语义特征，直接参与融合，不要“先加工再融合”
 ```
 
-**features:[C1_2, C3, C4, C5]**是输入经VGG16网络在这几个block输出的中间结果（是特征图）
-
-
-
-> ##### 使用分类与回归两个分支预测人群数量与位置。
-
-#### 分类分支
+## 分类分支
 
 预测anchor point是不是人(给出一个二分类概率（是不是“人”）)
 
-#### 回归分支
+```py
+#num_features_in：输入特征图的通道数
+#num_anchor_points=4：每个小块（patch）内的锚点数量
+#num_classes=80：分类的类别数，默认为 80
+#Prior=0.01 ：一个先验概率（prior）
+#feature_size=256：特征中间图的通道数
 
-预测人群的精确位置坐标(给出预测的人（或目标）坐标相对于某个 Anchor Point 的偏移量**，换句话说回归给出的是偏移量**)
+class ClassificationModel(nn.Module):
+    def __init__(self, num_features_in, num_anchor_points=4, num_classes=80, prior=0.01, feature_size=256):
+        super(ClassificationModel, self).__init__()
 
-`p2pnet.py`211行
+        self.num_classes = num_classes
+        self.num_anchor_points = num_anchor_points
 
-```python
-output_coord = regression + anchor_points
+        self.conv1 = nn.Conv2d(num_features_in, feature_size, kernel_size=3, padding=1)
+        self.act1 = nn.ReLU()
+
+        self.conv2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
+        self.act2 = nn.ReLU()
+
+        self.conv3 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
+        self.act3 = nn.ReLU()
+
+        self.conv4 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
+        self.act4 = nn.ReLU()
+
+        self.output = nn.Conv2d(feature_size, num_anchor_points * num_classes, kernel_size=3, padding=1)
+        self.output_act = nn.Sigmoid()
 ```
 
-`regression`：回归分支输出的偏移量（Δx, Δy），单位为像素
+```py
+#x是[B,C,H,W]
 
-`anchor_points`：每个 anchor point 的坐标，是固定的、预先生成好的
+def forward(self, x):
+        out = self.conv1(x)
+        out = self.act1(out)
 
-`output_coord`：模型最终预测的人群坐标（实际位置）
+        out = self.conv2(out)
+        out = self.act2(out)
 
-#### anchor point
+        out = self.output(out)#[B,8,H,W]。8 = 4(anchor) * 2(class)
 
-`p2pnet.py`
+        out1 = out.permute(0, 2, 3, 1)#[B,H,W,8]
+
+        #下面进行reshape
+        
+        #获取维度信息
+        batch_size, width, height, _ = out1.shape
+        
+        #维度重塑 [B,H,W,4,2]
+        out2 = out1.view(batch_size, width, height, self.num_anchor_points, self.num_classes)
+
+        return out2.contiguous().view(x.shape[0], -1, self.num_classes)#[B,H*W*anchor,2]
+        #输出的最后一个维度的2，表示[有人头的概率，无人头的概率]
+```
+
+
+
+## 回归分支
+
+```py
+#4个卷积层（带 ReLU 激活函数）和 1 个输出卷积层
+
+#num_features_in：输入特征图的通道数(按照程序的输入流，应该是从FPN的输出来的)
+#num_anchor_points=4：每个小块（patch）里的锚点数量
+#feature_size=256：中间特征图的通道数
+
+class RegressionModel(nn.Module):
+    def __init__(self, num_features_in, num_anchor_points=4, feature_size=256):
+        super(RegressionModel, self).__init__()
+
+        self.conv1 = nn.Conv2d(num_features_in, feature_size, kernel_size=3, padding=1)
+        self.act1 = nn.ReLU()
+
+        self.conv2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
+        self.act2 = nn.ReLU()
+
+        self.conv3 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
+        self.act3 = nn.ReLU()
+
+        self.conv4 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
+        self.act4 = nn.ReLU()
+
+        self.output = nn.Conv2d(feature_size, num_anchor_points * 2, kernel_size=3, padding=1)
+        #num_anchor_points * 2的乘2是：每个锚点需要预测 2 个值（x 和 y 方向的偏移量）
+        #看作每个 [h, w] 的 patch 里有 num_anchor_points 个点，每个点要预测两个值：(Δx, Δy)
+```
+
+```py
+ # x：输入特征图，通常来自 FPN（特征金字塔网络），形状是[B,C,H,W]
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.act1(out)
+
+        out = self.conv2(out)
+        out = self.act2(out)
+
+        out = self.output(out)#回归预测在这里
+
+        
+        #reshape
+        out = out.permute(0, 2, 3, 1)# [B, H, W, 8]
+        
+        return out.contiguous().view(out.shape[0], -1, 2)# [B, H*W*4, 2]
+        #H*W*4是所有anchor点的数目，2的x和y
+```
+
+## anchor point
+
+```py
+#特征金字塔的层级：表示在哪些层生成锚点
+#每个层级的步长（stride）:不指定就是2^层级
+
+class AnchorPoints(nn.Module):
+    def __init__(self, pyramid_levels=None, strides=None, row=3, line=3):
+        super(AnchorPoints, self).__init__()
+
+        if pyramid_levels is None:
+            self.pyramid_levels = [3, 4, 5, 6, 7]
+        else:
+            self.pyramid_levels = pyramid_levels
+
+        if strides is None:
+            self.strides = [2 ** x for x in self.pyramid_levels]
+
+        self.row = row
+        self.line = line
+```
+
+```py
+#image：[B,3,H,W]
+  def forward(self, image):
+        image_shape = image.shape[2:]#[H,W]
+        image_shape = np.array(image_shape)#转换为 NumPy 数组。
+        
+        #计算每个层级（pyramid_levels）的特征图大小
+        image_shapes = [(image_shape + 2 ** x - 1) // (2 ** x) for x in self.pyramid_levels]
+        #image_shapes是[[H,W],[H,W],[H,W]....]
+
+        all_anchor_points = np.zeros((0, 2)).astype(np.float32)
+        #创建一个空的 NumPy 数组，用来存储所有锚点的坐标（0行2列）
+        
+        
+        for idx, p in enumerate(self.pyramid_levels):#遍历每个层级
+            anchor_points = generate_anchor_points(2**p, row=self.row, line=self.line)#生成锚点位置模版(一个patch里)
+            shifted_anchor_points = shift(image_shapes[idx], self.strides[idx], anchor_points)#平移到对应位置
+            all_anchor_points = np.append(all_anchor_points, shifted_anchor_points, axis=0)#把shifted_anchor_points添加到 all_anchor_points
+
+         #添加批维度[B,N,2]
+        all_anchor_points = np.expand_dims(all_anchor_points, axis=0)
+       
+        #锚点坐标从 NumPy 格式变成 PyTorch 格式
+        if torch.cuda.is_available():
+            return torch.from_numpy(all_anchor_points.astype(np.float32)).cuda()
+        else:
+            return torch.from_numpy(all_anchor_points.astype(np.float32))
+```
 
 ```python
+#这个函数其实是在输出锚点分布的格式模版
+
+#在一个stride×stride 的小块（patch）中,生成row×line 网格的锚点
+#默认参数为 stride=16, row=3, line=3，即在一个 16×16像素的小块中生成 3×3=9个锚点
 def generate_anchor_points(stride=16, row=3, line=3):
-    row_step = stride / row
-    line_step = stride / line
-
+    #1. 计算锚点的间距
+    row_step = stride / row      #每行锚点之间的间距
+    line_step = stride / line    #每列锚点之间的间距
+    
+    #2. 计算锚点的偏移量（相对于小块中心的坐标）
     shift_x = (np.arange(1, line + 1) - 0.5) * line_step - stride / 2
+    #np.arange(1, line + 1)生成一个NumPy数组，从1到line + 1
     shift_y = (np.arange(1, row + 1) - 0.5) * row_step - stride / 2
-
+    
+    #3. 将 x 和 y 的偏移量组合成所有可能的坐标对。x和y现在都是row * line的二维矩阵
     shift_x, shift_y = np.meshgrid(shift_x, shift_y)
 
+    #4. 改变形状
     anchor_points = np.vstack((
         shift_x.ravel(), shift_y.ravel()
     )).transpose()
+    #shift_x.ravel() 和 shift_y.ravel() 将网格坐标展平为一维数组。
+    #np.vstack 堆叠 x 和 y 坐标，生成形状为row * line的pair数组
 
     return anchor_points
+    #返回一个形状为row * line的pair数组，表示小块内所有锚点的坐标。
 ```
 
-`stride=16`：每个特征图像素对应原图 16×16
+```py
+#shift是作用域某一层特征图。把锚点模板（一组预设的偏移量）搬到特征图的每个像素位置，生成所有锚点的实际坐标。
+#shape是特征图的大小[H,W]
+#stride指明一个patch有多大
+#锚点位置模版
 
-`row = 3,line = 3`：均匀分布`row  * line`个anchor point
+def shift(shape, stride, anchor_points):
+    shift_x = (np.arange(0, shape[1]) + 0.5) * stride
+    shift_y = (np.arange(0, shape[0]) + 0.5) * stride
 
-- 假设模型输入图像是 `512×512`
+    shift_x, shift_y = np.meshgrid(shift_x, shift_y)
 
-- Backbone + FPN 输出的特征图是 `32×32`
+    shifts = np.vstack((
+        shift_x.ravel(), shift_y.ravel()
+    )).transpose()
 
-- 那么每个 anchor 就覆盖一块：
+    A = anchor_points.shape[0]
+    K = shifts.shape[0]
+    all_anchor_points = (anchor_points.reshape((1, A, 2)) + shifts.reshape((1, K, 2)).transpose((1, 0, 2)))
+    all_anchor_points = all_anchor_points.reshape((K * A, 2))
 
-  ```
-  复制编辑
-  512 / 32 = 16 像素 × 16 像素
-  ```
+    return all_anchor_points
+```
 
-👉 所以每个 anchor roughly 负责周围 `16×16` 像素区域的人头
+
 
 > ##### 使用匈牙利算法（Hungarian Matcher）匹配预测点与真实点。
 
@@ -249,322 +508,6 @@ train_set, val_set = loading_data(args.data_root)
 
 ```py
 class SHHA(Dataset)#继承自PyTorch 的 Dataset类
-```
-
-
-
-------
-
-### `p2pnet.py`
-
-- **功能**：
-  - 定义 P2PNet 模型结构：
-    - 回归分支预测点坐标
-    - 分类分支预测是否为前景
-    - 使用 anchor points + FPN + backbone
-  - 定义 `SetCriterion_Crowd`：用于计算点位置与分类的损失
-  
-- **输入**：
-  - 图像张量（已转换为 `NestedTensor`）
-  
-- **输出**：
-  
-  - 模型输出字典：
-    
-    `pred_logits`: 预测的前景概率，`[B, N, 2]`
-    
-    `pred_points`: 预测坐标，`[B, N, 2]`
-  
-- **程序**
-
-| RegressionModel     | 回归分支：预测每个 anchor 的坐标偏移量 |
-| ------------------- | -------------------------------------- |
-| ClassificationModel | 分类分支：预测每个 anchor 是否是前景   |
-| AnchorPoints        | 生成所有金字塔层级的锚点位置           |
-| Decoder             | FPN（特征金字塔结构）：融合多层特征图  |
-| P2PNet              | 整个模型结构，组合 backbone+FPN+两分支 |
-| SetCriterion_Crowd  | 计算分类与回归损失                     |
-
-````py
-import torch
-import torch.nn.functional as F
-from torch import nn
-
-from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
-                       accuracy, get_world_size, interpolate,
-                       is_dist_avail_and_initialized)
-````
-
-**RegressionModel**
-
-**功能**：从特征图中预测 anchor 的坐标偏移量（Δx, Δy）
-
-```py
-#self.conv1,conv2,conv3,conv4,output：执行一次二维卷积运算
-#self.act1,self.act2.self.act3.self.act4：对结果执行一次 ReLU(x) = max(0, x)
-def __init__(self, num_features_in, num_anchor_points=4, feature_size=256):
-        super(RegressionModel, self).__init__()
-#num_features_in:我一开始接收到的图像通道数是多少
-#num_anchor_points:我每个位置要预测几个点
-#feature_size:我中间卷积层有多少通道
-                    #nn.Conv2d(输入通道数，输出通道数，卷积核为3*3，输出尺寸不变)
-        self.conv1 = nn.Conv2d(num_features_in, feature_size, kernel_size=3, padding=1)
-        self.act1 = nn.ReLU()
-
-        self.conv2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act2 = nn.ReLU()
-
-        self.conv3 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act3 = nn.ReLU()
-
-        self.conv4 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act4 = nn.ReLU()
-
-        self.output = nn.Conv2d(feature_size, num_anchor_points * 2, kernel_size=3, padding=1)
-#[B, C, H, W] → reshape → [B, N, 2]
-#x 是 Tensor[B, C, H, W]
- def forward(self, x):
-        out = self.conv1(x)
-        out = self.act1(out)
-
-        out = self.conv2(out)
-        out = self.act2(out)
-
-        out = self.output(out)
-
-        out = out.permute(0, 2, 3, 1)#[B, 8, H, W] → [B, H, W, 8]把通道放最后，方便 reshape
-
-        return out.contiguous().view(out.shape[0], -1, 2)
-```
-
-**ClassificationModel**
-
-**功能**：从特征图中预测每个 anchor 是不是“人”
-
-```python
-#self.conv1 ~ self.conv4：卷积 + 激活  
-#self.output：输出 [num_anchors * num_classes]  
-#self.output_act：Sigmoid 激活（让输出值在 0~1 之间）
-def __init__(self, num_features_in, num_anchor_points=4, num_classes=80, prior=0.01, feature_size=256):
-        super(ClassificationModel, self).__init__()
-
-        self.num_classes = num_classes
-        self.num_anchor_points = num_anchor_points
-
-        self.conv1 = nn.Conv2d(num_features_in, feature_size, kernel_size=3, padding=1)
-        self.act1 = nn.ReLU()
-
-        self.conv2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act2 = nn.ReLU()
-
-        self.conv3 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act3 = nn.ReLU()
-
-        self.conv4 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act4 = nn.ReLU()
-
-        self.output = nn.Conv2d(feature_size, num_anchor_points * num_classes, kernel_size=3, padding=1)
-        self.output_act = nn.Sigmoid()
-        
-        
-#[B, C, H, W] → reshape → [B, N, num_classes]
-def forward(self, x):
-        out = self.conv1(x)
-        out = self.act1(out)
-
-        out = self.conv2(out)
-        out = self.act2(out)
-
-        out = self.output(out)
-
-        out1 = out.permute(0, 2, 3, 1)
-
-        batch_size, width, height, _ = out1.shape
-
-        out2 = out1.view(batch_size, width, height, self.num_anchor_points, self.num_classes)
-
-        return out2.contiguous().view(x.shape[0], -1, self.num_classes)
-
-    
-    
-# generate the reference points in grid layout
-def generate_anchor_points(stride=16, row=3, line=3):
-    row_step = stride / row
-    line_step = stride / line
-
-    shift_x = (np.arange(1, line + 1) - 0.5) * line_step - stride / 2
-    shift_y = (np.arange(1, row + 1) - 0.5) * row_step - stride / 2
-
-    shift_x, shift_y = np.meshgrid(shift_x, shift_y)
-
-    anchor_points = np.vstack((
-        shift_x.ravel(), shift_y.ravel()
-    )).transpose()
-
-    return anchor_points
-
-
-# shift the meta-anchor to get an acnhor points
-def shift(shape, stride, anchor_points):
-    shift_x = (np.arange(0, shape[1]) + 0.5) * stride
-    shift_y = (np.arange(0, shape[0]) + 0.5) * stride
-
-    shift_x, shift_y = np.meshgrid(shift_x, shift_y)
-
-    shifts = np.vstack((
-        shift_x.ravel(), shift_y.ravel()
-    )).transpose()
-
-    A = anchor_points.shape[0]
-    K = shifts.shape[0]
-    all_anchor_points = (anchor_points.reshape((1, A, 2)) + shifts.reshape((1, K, 2)).transpose((1, 0, 2)))
-    all_anchor_points = all_anchor_points.reshape((K * A, 2))
-
-    return all_anchor_points
-```
-
-
-
-**AnchorPoints**
-
- **功能**：根据输入图像尺寸生成所有 anchor point 坐标（作为参考位置）
-
-```py
-#self.pyramid_levels：特征金字塔层级（默认 [3,4,5,6,7]，P2PNet 实际只用了 [3]）
-#self.strides：每个层级对应的下采样倍数（比如 8, 16, 32...）
-#self.row, self.line：每个格子里 anchor 点的行数、列数
-def __init__(self, pyramid_levels=None, strides=None, row=3, line=3):
-        super(AnchorPoints, self).__init__()
-
-        if pyramid_levels is None:
-            self.pyramid_levels = [3, 4, 5, 6, 7]
-        else:
-            self.pyramid_levels = pyramid_levels
-
-        if strides is None:
-            self.strides = [2 ** x for x in self.pyramid_levels]
-
-        self.row = row
-        self.line = line
-        
-        
-#forward(image)：生成 [1, N, 2] 的 anchor 坐标张量（N = 所有锚点数
-def forward(self, image):
-        image_shape = image.shape[2:]
-        image_shape = np.array(image_shape)
-        image_shapes = [(image_shape + 2 ** x - 1) // (2 ** x) for x in self.pyramid_levels]
-
-        all_anchor_points = np.zeros((0, 2)).astype(np.float32)
-        # get reference points for each level
-        for idx, p in enumerate(self.pyramid_levels):
-            anchor_points = generate_anchor_points(2**p, row=self.row, line=self.line)
-            shifted_anchor_points = shift(image_shapes[idx], self.strides[idx], anchor_points)
-            all_anchor_points = np.append(all_anchor_points, shifted_anchor_points, axis=0)
-
-        all_anchor_points = np.expand_dims(all_anchor_points, axis=0)
-        # send reference points to device
-        if torch.cuda.is_available():
-            return torch.from_numpy(all_anchor_points.astype(np.float32)).cuda()
-        else:
-            return torch.from_numpy(all_anchor_points.astype(np.float32))
-```
-
-**Decoder**
-
-**功能**：FPN结构，融合 C3、C4、C5 多层特征图
-
-```py
-#P3_1, P4_1, P5_1：对 C3~C5 降维的 1x1 卷积
-#P3_2, P4_2, P5_2：后处理的 3x3 卷积
-#P5_upsampled, P4_upsampled：上采样操作
-def __init__(self, C3_size, C4_size, C5_size, feature_size=256):
-        super(Decoder, self).__init__()
-
-        # upsample C5 to get P5 from the FPN paper
-        self.P5_1 = nn.Conv2d(C5_size, feature_size, kernel_size=1, stride=1, padding=0)
-        self.P5_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
-        self.P5_2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
-
-        # add P5 elementwise to C4
-        self.P4_1 = nn.Conv2d(C4_size, feature_size, kernel_size=1, stride=1, padding=0)
-        self.P4_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
-        self.P4_2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
-
-        # add P4 elementwise to C3
-        self.P3_1 = nn.Conv2d(C3_size, feature_size, kernel_size=1, stride=1, padding=0)
-        self.P3_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
-        self.P3_2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
-
-        
-#forward([C3, C4, C5]) → [P3, P4, P5]
-def forward(self, inputs):
-        C3, C4, C5 = inputs
-
-        P5_x = self.P5_1(C5)
-        P5_upsampled_x = self.P5_upsampled(P5_x)
-        P5_x = self.P5_2(P5_x)
-
-        P4_x = self.P4_1(C4)
-        P4_x = P5_upsampled_x + P4_x
-        P4_upsampled_x = self.P4_upsampled(P4_x)
-        P4_x = self.P4_2(P4_x)
-
-        P3_x = self.P3_1(C3)
-        P3_x = P3_x + P4_upsampled_x
-        P3_x = self.P3_2(P3_x)
-
-        return [P3_x, P4_x, P5_x]
-```
-
-**P2PNet**
-
-**功能**：组合整个网络结构：backbone + FPN + 回归/分类分支 + 锚点生成
-
-```python
-#self.backbone：VGG16骨干网络
-#self.fpn：FPN 解码器（Decoder）
-#self.regression：回归分支
-#self.classification：分类分支
-#self.anchor_points：Anchor 生成器
-#self.num_classes：类别数（固定为2：人 / 非人）
-def __init__(self, backbone, row=2, line=2):
-        super().__init__()
-        self.backbone = backbone
-        self.num_classes = 2
-        # the number of all anchor points
-        num_anchor_points = row * line
-
-        self.regression = RegressionModel(num_features_in=256, num_anchor_points=num_anchor_points)
-        self.classification = ClassificationModel(num_features_in=256, \
-                                            num_classes=self.num_classes, \
-                                            num_anchor_points=num_anchor_points)
-
-        self.anchor_points = AnchorPoints(pyramid_levels=[3,], row=row, line=line)
-
-        self.fpn = Decoder(256, 512, 512)
-
-        
-        
-#→ output_coord = regression + anchor_points
-#→ output_class = classification
-#→ 输出 dict：{'pred_logits': 分类结果, 'pred_points': 坐标结果}
-def forward(self, samples: NestedTensor):
-        # get the backbone features
-        features = self.backbone(samples)
-        # forward the feature pyramid
-        features_fpn = self.fpn([features[1], features[2], features[3]])
-
-        batch_size = features[0].shape[0]
-        # run the regression and classification branch
-        regression = self.regression(features_fpn[1]) * 100 # 8x
-        classification = self.classification(features_fpn[1])
-        anchor_points = self.anchor_points(samples).repeat(batch_size, 1, 1)
-        # decode the points as prediction
-        output_coord = regression + anchor_points
-        output_class = classification
-        out = {'pred_logits': output_class, 'pred_points': output_coord}
-       
-        return out
 ```
 
 
@@ -874,7 +817,7 @@ samples: NestedTensor（包含图像张量 [B, 3, H, W],以及一个[B,H,W]表�
 targets: List[dict]，长度为 B，每个 dict 是 target
 ```
 
-## samples被送入模型->输出pred_logits, pred_points
+## samples被送入模型（VGG16/FPN)->输出pred_logits, pred_points
 
 samples输入到P2PNet的forward
 
@@ -965,27 +908,6 @@ transform = standard_transforms.Compose([
 ])
 ```
 
-### .shape/.unsqueeze(0)
-
-三维时
-
-[channels, height, width]
-
-四维时
-
-[batch_size=4, channels=3, height=224, width=224]
-
-`4`张（每张由`3`层`224` * `224`叠加起来）
-
-`channels`：灰度图的通道数是 1，RGB 彩色图的通道数是 3（R,G,B)
-
-图形的通道：
-
-```python
-t = torch.randn(4, 3, 224, 224)
-print(t.shape)  #torch.Size([4, 3, 224, 224])
-```
-
 ### nn.Conv2d
 
 ```python
@@ -993,7 +915,7 @@ nn.Conv2d(
     in_channels,     # 输入通道数
     out_channels,    # 输出通道数（卷积核个数）
     kernel_size=3,   # 卷积核大小：3×3
-    padding=1        # 保证输出尺寸不变
+    padding=1        #特征图周围加 1 像素的填充，确保卷积后特征图的空间大小不变。
 )
 ```
 
@@ -1013,6 +935,14 @@ __len__()：告诉你总共有多少个样本
 
 __getitem__(index)：告诉你怎么通过索引取出第 index 个样本
 ```
+
+
+
+
+
+
+
+
 
 # 代码阅读顺序
 
