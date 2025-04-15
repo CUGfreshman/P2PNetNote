@@ -1,5 +1,27 @@
 # P2PNet人群计数模型
 
+**conda python3.7**
+
+```
+conda create -n p2p37 python=3.7 -y
+```
+
+**PyTorch 1.7.1 + CUDA 11.0**
+
+```
+pip install torch==1.7.1+cu110 torchvision==0.8.2+cu110 -f https://download.pytorch.org/whl/torch_stable.html
+```
+
+**其他依赖**
+
+```
+pip install tensorboardX easydict pandas numpy==1.19.2 scipy==1.5.2 matplotlib Pillow opencv-python -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+
+
+
+
 ```cpp
 git status
 git add .
